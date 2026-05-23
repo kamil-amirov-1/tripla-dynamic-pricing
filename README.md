@@ -1,82 +1,135 @@
-<div align="center">
-   <img src="/img/logo.svg?raw=true" width=600 style="background-color:white;">
-</div>
+# Dynamic Pricing Take-home Assignment Solution
 
-# Backend Engineering Take-Home Assignment: Dynamic Pricing Proxy
+## Overview
 
-Welcome to the Tripla backend engineering take-home assignment\! 🧑‍💻 This exercise is designed to simulate a real-world problem you might encounter as part of our team.
+A caching layer in front of Tripla's dynamic pricing model. The model is expensive
+to run and has a hard limit of 1,000 API calls/day. The goal was to serve 10,000
+user requests/day without blowing that budget, while always serving rates that are
+**no older than 5 minutes**.
 
-⚠️ **Before you begin**, please review the main [FAQ](/README.md#frequently-asked-questions). It contains important information, **including our specific guidelines on how to submit your solution.**
+The scaffold already had the endpoint ready and calling the model on every request.
+My job was to make that sustainable.
 
-## The Challenge
+---
+## Why I chose batch-all caching
 
-At Tripla, we use a dynamic pricing model for hotel rooms. Instead of static, unchanging rates, our model uses a real-time algorithm to adjust prices based on market demand and other data signals. This helps us maximize both revenue and occupancy.
+My first instinct was to cache each `(period, hotel, room)` combination separately —
+fetch on miss, cache for 5 minutes, done. Then I did the math:
 
-Our Data and AI team built a powerful model to handle this, but its inference process is computationally expensive to run. To make this product more cost-effective, we analyzed the model's output and found that a calculated room rate remains effective for up to 5 minutes.
+- 4 seasons × 3 hotels × 3 rooms = **36 unique combinations**
+- 24h/5min = **288 expiry windows per day**
+- If each combination expires independently: 36 × 288 = **10,368 upstream calls/day**
 
-This insight presents a great optimization opportunity, and that's where you come in.
+That is 10x over the 1,000/day limit, even with caching enabled.
 
-## Your Mission
+The model API supports **batch requests** - so we can send multiple combinations in one
+call. I changed the strategy: on any cache miss, fetch **all 36 combinations** in
+one call and cache each returned rate for 5 minutes. In the no-contention case, that
+is **288 calls/day**, with plenty of headroom.
 
-Your mission is to build an efficient service that acts as an intermediary to our dynamic pricing model. This service will be responsible for providing rates to our users while respecting the operational constraints of the expensive model behind it.
+---
+## Why Redis and not memory store
 
-You will start with a Ruby on Rails application that is already integrated with our dynamic pricing model. However, the current implementation fetches a new rate for every single request. Your mission is to ensure this service handles the pricing models' constraints.
+I considered `memory_store` first. It is simpler because it needs no extra service.
+It works for a single Rails process, but it is not a production-safe coordination
+mechanism.
 
-## Core Requirements
+Puma can run multiple worker processes in production, and each process has its own
+memory. If one worker fetches fresh rates, the other workers cannot see that cache
+entry. Horizontal scaling has the same problem across containers.
 
-1. Review the pricing model's API and its constraints. The model's docker image and documentation are hosted on dockerhub:  [tripladev/rate-api](https://hub.docker.com/r/tripladev/rate-api).
+Redis gives the app one shared pricing cache. All workers and app containers
+read from and write to the same store, so one worker's fresh rates benefit all others.
 
-2. Ensure rate validity. A rate fetched from the pricing model is considered valid for 5 minutes. Your service must ensure that any rate it provides for a given set of parameters (`period`, `hotel`, `room`) is no older than this 5-minute window.
+---
+## How cache misses are handled
 
-3. Honor throughput requirements. Your solution must be able to handle at least 10,000 requests per day from our users while using a single API token.
+Each rate is stored under its own Redis key — `pricing:rate:{period}:{hotel}:{room}`
+- with a 5-minute TTL.
 
-## How We'll Evaluate Your Work
+When a request arrives for a combination that is not in Redis, the service fetches
+all 36 combinations in one upstream batch call, writes each returned rate as its own
+key, and logs any combinations absent from the response. Requests for returned
+combinations succeed. Requests for missing combinations get a 503 - the rate is unavailable right now (the next 
+refresh cycle might recover them). So a partial upstream failure does not affect users asking for rates that were returned.
 
-This isn't just about getting the right answer. We're excited to see how you approach the problem. Treat this as you would a production-ready feature.
+At the stated load (10,000 req/day ~ 0.12 req/sec), I chose not to add a refresh lock
+in this version. That keeps the implementation smaller for the assignment while still
+meeting the budget in normal operation - one batch refresh per 5-minute window is about
+288 upstream calls/day.
 
-  * We'll be looking for clean, well-structured, and testable code. Feel free to add dependencies or refactor the existing scaffold as you see fit.
-  * How do you decide on your approach to meeting the performance and cost requirements? Documenting your thought process is a great way to share this.
-  * A reliable service anticipates failure. How does your service behave if the pricing model is slow, or returns an error? Providing descriptive error messages to the end-user is a key part of a robust API.
-  * We want to see how you work around constraints and navigate an existing codebase to deliver a solution.
+The tradeoff is that concurrent cold-cache misses can trigger duplicate batch calls.
+Those duplicates do not affect correctness because all callers write fresh rates with
+the same TTL, but they can increase upstream usage during bursts or deploy restarts.
 
+todo: For a higher-concurrency deployment, the next hardening step is a Redis `SET NX` lock
+around batch refresh.
 
-## Minimum Deliverables
+---
+## Architecture
 
-1.  A link to your Git repository containing the complete solution.
-2.  Clear instructions in the `README.md` on how to build, test, and run your service.
+![diagram.png](diagram.png)
 
-We highly value seeing your thought process. A great submission will also include documentation (e.g., in the `README.md`) discussing the design choices you made. Consider outlining different approaches you considered, their potential tradeoffs, and a clear rationale for why you chose your final solution.
+The main components:
 
-## Development Environment Setup
+- **`PricingController`** - validates params, calls the service, renders the response.
+- **`PricingService`** - orchestrates the above, maps errors to user-facing messages,
+  logs full exception class and message server-side for unexpected failures.
+- **`RateCacheService`** - owns the cache logic. Reads the requested per-combination
+  key from Redis. On miss, fetches all 36 combinations in one upstream batch call,
+  writes the returned rates as separate keys with a 5-minute TTL, and logs missing
+  combinations.
+- **`RateApiClient`** - HTTP wrapper around the upstream model. Handles batch
+  requests, split timeouts, and normalises all network errors into `RateApiError`.
 
-The project scaffold is a minimal Ruby on Rails application with a `/api/v1/pricing` endpoint. While you're free to configure your environment as you wish, this repository is pre-configured for a Docker-based workflow that supports live reloading for your convenience.
+---
+## Error handling
 
-The provided `Dockerfile` builds a container with all necessary dependencies. Your local code is mounted directly into the container, so any changes you make on your machine will be reflected immediately. Your application will need to communicate with the external pricing model, which also runs in its own Docker container.
+I split errors by whose fault they are:
+- **400** - the client sent invalid or missing params. Caught before the service is
+  called.
+- **503** - everything server-side: upstream timeout, upstream error, Redis
+  unavailable, a requested combination absent from the upstream response, or an
+  unexpected internal error.
 
-### Quick Start Guide
+For now I specifically chose not to fall back to direct upstream calls when Redis is down.
+It feels like a helpful degradation, but it would bypass the rate-limit protection
+and risk exhausting the daily quota. A 503 with a clear error message is more honest. (TBD)
 
-Here is a list of common commands for building, running, and interacting with the Dockerized environment.
+---
+## Alternatives considered
 
-```bash
+**Proactive cache warming** - a background job refreshes all 36 combinations every
+~4.5 minutes so the cache is always warm and no request ever waits for an upstream
+call. Cleaner user experience, same API budget. I left it out because at ~0.12 req/s
+average load the miss latency is infrequent and acceptable, and adding a scheduler
+(sidekiq, cron) is operational complexity I did not want to take on without a clearer
+need. It is the most obvious next step if latency becomes a concern.
 
-# --- 1. Build & Run The Main Application ---
-# Build and run the Docker compose
-docker compose up -d --build
+**file_store** - works across Puma workers on the same host, needs no extra service.
+Does not survive multi-container deployments. Redis requires a small amount of local
+setup but is the standard for shared cache in containerised Rails services.
 
-# --- 2. Test The Endpoint ---
-# Send a sample request to your running service
-curl 'http://localhost:3000/api/v1/pricing?period=Summer&hotel=FloatingPointResort&room=SingletonRoom'
+**Single-key snapshot approach** - store all 36 rates in one Redis key and look up
+the requested combination in memory. Simpler to implement. Rejected because partial
+upstream responses make the snapshot semantically ambiguous: is the catalog fresh,
+degraded, or incomplete? Per-combination keys make that explicit — each key either
+exists (fresh rate) or is absent (genuinely unavailable), with no ambiguity about
+what the stored data represents.
 
-# --- 3. Run Tests ---
-# Run the full test suite
-docker compose exec interview-dev ./bin/rails test
+**race_condition_ttl** - Rails can serve stale cached data for a short grace window
+while regenerating a value. I eliminated it, the assignment says a rate is valid for
+5 minutes. Serving a rate beyond that window would violate the core requirement.
 
-# Run a specific test file
-docker compose exec interview-dev ./bin/rails test test/controllers/pricing_controller_test.rb
+---
+## Known limitations
 
-# Run a specific test by name
-docker compose exec interview-dev ./bin/rails test test/controllers/pricing_controller_test.rb -n test_should_get_pricing_with_all_parameters
-```
-
-
-Good luck, and we look forward to seeing what you build\!
+- **No proactive warming** - first request after each 5-minute window pays the
+  upstream latency. (TBD)
+- **No refresh lock** - concurrent cache misses can trigger multiple simultaneous
+  upstream calls. At the stated load this is acceptable, but at significantly higher
+  concurrency a Redis SET NX lock would eliminate redundant calls. (TBD)
+- **No retry on upstream failure** - a single error returns 503 immediately.
+  Exponential backoff with a small retry count would be a sensible addition. (TBD)
+- **Single Redis instance** - no cluster HA. An outage returns 503 and
+  is logged; it does not degrade to unprotected upstream calls. (TBD)
