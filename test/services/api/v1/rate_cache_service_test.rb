@@ -192,7 +192,7 @@ class Api::V1::RateCacheServiceTest < ActiveSupport::TestCase
   test "waiter returns nil when lock holder marks combination as missing" do
     Api::V1::RateCacheService.stub(:acquire_lock, ->(_) { false }) do
       Api::V1::RateCacheService.stub(:wait_for_lock_release, -> {
-        Rails.cache.write('pricing:missing:Summer:FloatingPointResort:SingletonRoom', true)
+        Rails.cache.write('pricing:rate:Summer:FloatingPointResort:SingletonRoom', Api::V1::RateCacheService::MISSING)
       }) do
         RateApiClient.stub(:get_rates_batch, ->(_) { flunk 'API should not be called' }) do
           assert_nil Api::V1::RateCacheService.get_rate(period: 'Summer', hotel: 'FloatingPointResort', room: 'SingletonRoom')

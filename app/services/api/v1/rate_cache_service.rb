@@ -4,6 +4,7 @@ module Api::V1
     LOCK_KEY  = 'pricing:refresh_lock'
     LOCK_TTL  = ENV.fetch('RATE_API_READ_TIMEOUT', 10).to_i + 5  # seconds; exceeds API timeout so Redis expires locks
     LOCK_WAIT = 0.05  # seconds between polls while waiting for another process to refresh
+    MISSING   = '__missing__'
 
     RELEASE_SCRIPT = <<~LUA.freeze
       if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -15,11 +16,12 @@ module Api::V1
 
     def self.get_rate(period:, hotel:, room:)
       cached = Rails.cache.read(cache_key(period, hotel, room))
+      return nil if cached == MISSING
       return cached if cached
-      return nil if Rails.cache.read(missing_key(period, hotel, room))
 
       ensure_cache_populated(period:, hotel:, room:)
-      Rails.cache.read(cache_key(period, hotel, room))
+      cached = Rails.cache.read(cache_key(period, hotel, room))
+      cached == MISSING ? nil : cached
     end
 
     private_class_method def self.ensure_cache_populated(period:, hotel:, room:)
@@ -33,9 +35,7 @@ module Api::V1
       else
         wait_for_lock_release
         # Lock holder failed without writing - raise instead of silent nil -> 404
-        unless Rails.cache.read(cache_key(period, hotel, room)) || Rails.cache.read(missing_key(period, hotel, room))
-          raise RateApiError, 'Rate temporarily unavailable, please retry'
-        end
+        raise RateApiError, 'Rate temporarily unavailable, please retry' if Rails.cache.read(cache_key(period, hotel, room)).nil?
       end
     end
 
@@ -58,7 +58,7 @@ module Api::V1
       missing_count = 0
       PricingCatalog::ALL_COMBINATIONS.each do |c|
         next if rates.any? { |r| cacheable_rate?(r) && matches?(r, **c) }
-        Rails.cache.write(missing_key(c[:period], c[:hotel], c[:room]), true, expires_in: CACHE_TTL)
+        Rails.cache.write(cache_key(c[:period], c[:hotel], c[:room]), MISSING, expires_in: CACHE_TTL)
         missing_count += 1
       end
       Rails.logger.warn("Pricing model missing #{missing_count} combination(s)") if missing_count > 0
@@ -96,10 +96,6 @@ module Api::V1
 
     private_class_method def self.cache_key(period, hotel, room)
       "pricing:rate:#{period}:#{hotel}:#{room}"
-    end
-
-    private_class_method def self.missing_key(period, hotel, room)
-      "pricing:missing:#{period}:#{hotel}:#{room}"
     end
   end
 end
