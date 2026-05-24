@@ -22,24 +22,29 @@ fetch on miss, cache for 5 minutes, done. Then I did the math:
 
 That is 10x over the 1,000/day limit, even with caching enabled.
 
-The model API supports **batch requests** - so we can send multiple combinations in one
-call. I changed the strategy: on any cache miss, fetch **all 36 combinations** in
-one call and cache each returned rate for 5 minutes. In the no-contention case, that
-is **288 calls/day**, with plenty of headroom.
+The model API supports **batch requests**, so I changed the strategy: on any cache
+miss, fetch **all 36 combinations** in one call and cache each rate for 5 minutes.
+That is **about 288 calls/day** with plenty of headroom.
 
 ---
 ## Why Redis and not memory store
 
-I considered `memory_store` first. It is simpler because it needs no extra service.
-It works for a single Rails process, but it is not a production-safe coordination
-mechanism.
+`memory_store` works for a single process but not across Puma workers or containers -
+each has its own memory, so one worker's cached rates are invisible to the others.
+Redis is a shared store that all workers and containers read from and write to.
 
-Puma can run multiple worker processes in production, and each process has its own
-memory. If one worker fetches fresh rates, the other workers cannot see that cache
-entry. Horizontal scaling has the same problem across containers.
+---
+## Why a refresh lock
 
-Redis gives the app one shared pricing cache. All workers and app containers
-read from and write to the same store, so one worker's fresh rates benefit all others.
+Average load is fine, but a deploy restart can start all workers with an empty cache. Without a
+lock, 10 concurrent cold misses fire 10 upstream calls. A Redis `SET NX EX` lock
+ensures only one process fetches at a time - everyone else waits, then reads from
+the populated cache. One call per window instead of N.
+
+The release uses a Lua script instead of a plain `DELETE`. If the holder crashes and
+the TTL expires, another process can acquire the lock before the cleanup runs - a
+plain `DELETE` would wipe it. The Lua script checks the token first, so only the
+original holder can release its own lock.
 
 ---
 ## How cache misses are handled
@@ -47,89 +52,65 @@ read from and write to the same store, so one worker's fresh rates benefit all o
 Each rate is stored under its own Redis key - `pricing:rate:{period}:{hotel}:{room}`
 - with a 5-minute TTL.
 
-When a request arrives for a combination not in Redis, the service acquires a Redis
-lock (`SET NX EX`). The lock holder fetches all 36 combinations in one upstream batch
-call, writes each returned rate as its own key, and releases the lock. The lock TTL
-is set above the API read timeout so an orphaned lock self-expires before any waiter
-hits its deadline. Only known combinations from `PricingCatalog` are written - unknown
-rows from the upstream response are discarded.
+On a cache miss the service acquires the lock, fetches all 36 combinations in one
+batch call, writes each returned rate, and releases the lock. Only combinations in
+`PricingCatalog` are written - unknown rows are discarded. Concurrent misses wait for
+the lock holder then read from cache. If the lock holder writes neither a rate nor a missing marker,
+waiters raise a 503 rather than silently returning nil.
 
-Concurrent requests that hit the same cache miss wait for the lock holder to finish,
-then read from cache. If the lock holder fails, it releases without writing. Waiters
-detect the absent key and raise a 503 rather than silently treating the failure as
-"rate not found".
-
-Requests for combinations the upstream did not return get a 404 - the rate is
-unavailable right now and the next refresh cycle may recover it. A partial upstream
-response does not affect users asking for rates that were returned.
+Combinations the upstream did not return are cached as missing for the same 5-minute
+window and return 404. This avoids repeatedly calling upstream for a temporarily
+unavailable combination. A partial response does not affect users asking for rates
+that were returned.
 
 ---
 ## Architecture
 
 ![diagram.png](diagram.png)
 
-The main components:
-
-- **`PricingController`** - validates params, calls the service, renders the response.
-- **`PricingService`** - orchestrates the above, maps errors to user-facing messages,
-  logs full exception class and message server-side for unexpected failures.
-- **`RateCacheService`** - owns the cache logic. Reads the requested per-combination
-  key from Redis. On miss, acquires a distributed lock, fetches all 36 combinations
-  in one upstream batch call, writes the returned rates as separate keys with a
-  5-minute TTL, and releases the lock. Concurrent misses wait for the lock holder;
-  if the holder fails, waiters raise a 503 rather than returning nil.
-- **`RateApiClient`** - HTTP wrapper around the upstream model. Handles batch
-  requests, split timeouts, and normalises all network errors into `RateApiError`.
+- **`PricingController`** - validates params, delegates to `PricingService`, renders the response.
+- **`PricingService`** - runs the service, maps errors to user-facing messages and HTTP status codes.
+- **`RateCacheService`** - owns the cache logic. On miss, acquires a distributed lock, fetches all 36 combinations, writes each rate with a 5-minute TTL, and releases the lock.
+- **`RateApiClient`** - HTTP wrapper. Handles batch requests, split timeouts, and normalizes all errors into `RateApiError`.
+- **`PricingCatalog`** - single source of truth for valid periods, hotels, and rooms. Used by the controller for validation and by `RateCacheService` to build the batch request and filter unknown rows.
 
 ---
 ## Error handling
 
 I split errors by whose fault they are:
-- **400** - the client sent invalid or missing params. Caught before the service is
-  called.
-- **404** - valid params, but the rate for this combination was not returned by the
-  upstream API in the latest batch response.
-- **503** - server-side failure: upstream timeout, upstream error, Redis unavailable,
-  or an unexpected internal error.
+- **400** - invalid or missing params. Caught before the service is called.
+- **404** - valid params but the rate was not returned by the upstream in the latest batch.
+- **503** - server-side failure: upstream timeout, upstream error, Redis unavailable, or an unexpected internal error.
 
-I specifically chose not to fall back to direct upstream calls when Redis is down.
-It feels like a helpful degradation, but it would bypass the rate-limit protection
-and risk exhausting the daily quota. A 503 with a clear error message is more honest.
+I chose not to fall back to direct upstream calls when Redis is down. It feels
+helpful but bypasses the rate-limit protection and risks exhausting the daily quota.
+A 503 is more honest.
 
 ---
 ## Alternatives considered
 
 **Proactive cache warming** - a background job refreshes all 36 combinations every
-~4.5 minutes so the cache is always warm and no request ever waits for an upstream
-call. Cleaner user experience, same API budget. I left it out because at ~0.12 req/s
-average load the miss latency is infrequent and acceptable, and adding a scheduler
-(sidekiq, cron) is operational complexity I did not want to take on without a clearer
-need. It is the most obvious next step if latency becomes a concern.
+~4.5 minutes so the cache is always warm. Same API budget, better latency. I left it
+out because at ~0.12 req/s the miss latency is infrequent and acceptable, and a
+scheduler adds operational complexity I did not need yet.
 
-**file_store** - works across Puma workers on the same host, needs no extra service.
-Does not survive multi-container deployments. Redis requires a small amount of local
-setup but is the standard for shared cache in containerised Rails services.
+**file_store** - works across Puma workers on the same host but not across containers.
+Redis is the standard for shared cache in containerized Rails services.
 
-**Single-key snapshot approach** - store all 36 rates in one Redis key and look up
-the requested combination in memory. Simpler to implement. Rejected because partial
-upstream responses make the snapshot semantically ambiguous: is the catalog fresh,
-degraded, or incomplete? Per-combination keys make that explicit - each key either
-exists (fresh rate) or is absent (genuinely unavailable), with no ambiguity about
-what the stored data represents.
+**Single-key snapshot** - store all 36 rates in one Redis key. Simpler, but rejected
+because partial upstream responses make the snapshot ambiguous. Per-combination keys
+are explicit - each key either exists or is absent.
 
-**race_condition_ttl** - Rails can serve stale cached data for a short grace window
-while regenerating a value. I eliminated it, the assignment says a rate is valid for
-5 minutes. Serving a rate beyond that window would violate the core requirement.
+**race_condition_ttl** - Rails can serve stale data for a short grace window while
+regenerating. Eliminated - the assignment says rates are valid for 5 minutes. Serving
+beyond that would violate the core requirement.
 
 ---
 ## Known limitations
 
-- **No proactive warming** - first request after each 5-minute window pays the
-  upstream latency.
+- **No proactive warming** - first request after each 5-minute window pays the upstream latency.
 - **No retry on upstream failure** - a single error returns 503 immediately.
-  Exponential backoff with a small retry count would be a sensible addition.
-- **Single Redis instance** - no cluster HA. An outage returns 503 and is logged;
-  it does not degrade to unprotected upstream calls.
+- **Single Redis instance** - no cluster HA. An outage returns 503 and does not degrade to unprotected upstream calls.
 
 ---
 ## How to run
@@ -138,7 +119,7 @@ while regenerating a value. I eliminated it, the assignment says a rate is valid
 docker compose up --build
 ```
 
-The Rails app starts on `http://localhost:3000`. 
+The Rails app starts on `http://localhost:3000`.
 Example requests:
 
 **200:**
@@ -156,7 +137,7 @@ curl "http://localhost:3000/api/v1/pricing?period=Summer&hotel=FloatingPointReso
 ## How to test
 
 ```bash
-bin/rails test
+docker compose exec interview-dev ./bin/rails test
 ```
 
 Tests use an in-memory cache store - no Redis required to run the test suite.
