@@ -106,6 +106,15 @@ regenerating. Eliminated - the assignment says rates are valid for 5 minutes. Se
 beyond that would violate the core requirement.
 
 ---
+## Observability
+
+I added structured logging because the main risk in this service is not CPU or database load, but upstream usage and cache behaviour.
+
+Request logs are compact single-line logs via Lograge. The pricing service also logs cache hits 
+and misses, refresh lock acquisition and waits, upstream refresh duration, and missing combination counts. 
+In production, these are the signals to alert on before upstream quota or availability becomes a user-facing problem.
+
+---
 ## Known limitations
 
 - **No proactive warming** - first request after each 5-minute window pays the upstream latency.

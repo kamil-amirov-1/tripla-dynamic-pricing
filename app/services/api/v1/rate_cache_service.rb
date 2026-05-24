@@ -16,9 +16,16 @@ module Api::V1
 
     def self.get_rate(period:, hotel:, room:)
       cached = Rails.cache.read(cache_key(period, hotel, room))
-      return nil if cached == MISSING
-      return cached if cached
+      if cached == MISSING
+        Rails.logger.info("event=pricing_cache_hit result=missing period=#{period} hotel=#{hotel} room=#{room}")
+        return nil
+      end
+      if cached
+        Rails.logger.info("event=pricing_cache_hit result=found period=#{period} hotel=#{hotel} room=#{room}")
+        return cached
+      end
 
+      Rails.logger.info("event=pricing_cache_miss period=#{period} hotel=#{hotel} room=#{room}")
       ensure_cache_populated(period:, hotel:, room:)
       cached = Rails.cache.read(cache_key(period, hotel, room))
       cached == MISSING ? nil : cached
@@ -27,12 +34,14 @@ module Api::V1
     private_class_method def self.ensure_cache_populated(period:, hotel:, room:)
       token = SecureRandom.hex
       if acquire_lock(token)
+        Rails.logger.info("event=pricing_lock_acquired")
         begin
           fetch_from_api_and_cache
         ensure
           release_lock(token)
         end
       else
+        Rails.logger.info("event=pricing_lock_waiting")
         wait_for_lock_release
         # Lock holder failed without writing - raise instead of silent nil -> 404
         raise RateApiError, 'Rate temporarily unavailable, please retry' if Rails.cache.read(cache_key(period, hotel, room)).nil?
@@ -40,10 +49,12 @@ module Api::V1
     end
 
     private_class_method def self.fetch_from_api_and_cache
+      started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       response = RateApiClient.get_rates_batch(PricingCatalog::ALL_COMBINATIONS)
 
       unless response.success?
         message = response.parsed_response&.dig('error') || 'Pricing model returned an error'
+        Rails.logger.error("event=pricing_upstream_error message=#{message}")
         raise RateApiError, message
       end
 
@@ -61,7 +72,10 @@ module Api::V1
         Rails.cache.write(cache_key(c[:period], c[:hotel], c[:room]), MISSING, expires_in: CACHE_TTL)
         missing_count += 1
       end
-      Rails.logger.warn("Pricing model missing #{missing_count} combination(s)") if missing_count > 0
+
+      duration_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at) * 1000).round
+      Rails.logger.info("event=pricing_upstream_success fetched=#{rates.size} missing=#{missing_count} duration_ms=#{duration_ms}")
+      Rails.logger.warn("event=pricing_upstream_partial missing=#{missing_count}") if missing_count > 0
     end
 
     private_class_method def self.acquire_lock(token)
