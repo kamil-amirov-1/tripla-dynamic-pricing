@@ -114,4 +114,28 @@ class Api::V1::PricingControllerTest < ActionDispatch::IntegrationTest
     json_response = JSON.parse(@response.body)
     assert_includes json_response["error"], "Invalid room"
   end
+
+  test "upstream is called once and result is served from cache on second request" do
+    call_count = 0
+    all_rates = PricingCatalog::ALL_COMBINATIONS.map do |c|
+      { 'period' => c[:period], 'hotel' => c[:hotel], 'room' => c[:room], 'rate' => '10000' }
+    end
+    batch_response = OpenStruct.new(success?: true, parsed_response: { 'rates' => all_rates })
+
+    Api::V1::RateCacheService.stub(:acquire_lock, ->(_) { true }) do
+      Api::V1::RateCacheService.stub(:release_lock, ->(_) { nil }) do
+        RateApiClient.stub(:get_rates_batch, ->(_) { call_count += 1; batch_response }) do
+          get api_v1_pricing_url, params: { period: 'Summer', hotel: 'FloatingPointResort', room: 'SingletonRoom' }
+          assert_response :success
+          assert_equal '10000', JSON.parse(@response.body)['rate']
+
+          get api_v1_pricing_url, params: { period: 'Autumn', hotel: 'GitawayHotel', room: 'BooleanTwin' }
+          assert_response :success
+          assert_equal '10000', JSON.parse(@response.body)['rate']
+        end
+      end
+    end
+
+    assert_equal 1, call_count
+  end
 end
