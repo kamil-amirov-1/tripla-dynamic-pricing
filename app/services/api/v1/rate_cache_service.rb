@@ -1,13 +1,5 @@
 module Api::V1
   class RateCacheService
-    PERIODS = %w[Summer Autumn Winter Spring].freeze
-    HOTELS  = %w[FloatingPointResort GitawayHotel RecursionRetreat].freeze
-    ROOMS   = %w[SingletonRoom BooleanTwin RestfulKing].freeze
-
-    ALL_COMBINATIONS = PERIODS.product(HOTELS, ROOMS)
-      .map { |period, hotel, room| { period:, hotel:, room: } }
-      .freeze
-
     CACHE_TTL = 5.minutes
 
     def self.get_rate(period:, hotel:, room:)
@@ -20,7 +12,7 @@ module Api::V1
     end
 
     private_class_method def self.fetch_and_cache_all
-      response = RateApiClient.get_rates_batch(ALL_COMBINATIONS)
+      response = RateApiClient.get_rates_batch(PricingCatalog::ALL_COMBINATIONS)
 
       unless response.success?
         message = response.parsed_response&.dig('error') || 'Pricing model returned an error'
@@ -35,7 +27,7 @@ module Api::V1
         Rails.cache.write(cache_key(r['period'], r['hotel'], r['room']), r['rate'], expires_in: CACHE_TTL)
       end
 
-      missing_count = ALL_COMBINATIONS.count { |c| rates.none? { |r| matches?(r, **c) } }
+      missing_count = PricingCatalog::ALL_COMBINATIONS.count { |c| rates.none? { |r| matches?(r, **c) } }
       Rails.logger.warn("Pricing model missing #{missing_count} combination(s)") if missing_count > 0
 
       rates

@@ -1,7 +1,7 @@
 require "test_helper"
 
 class Api::V1::RateCacheServiceTest < ActiveSupport::TestCase
-  ALL_RATES = Api::V1::RateCacheService::ALL_COMBINATIONS.map do |c|
+  ALL_RATES = PricingCatalog::ALL_COMBINATIONS.map do |c|
     { 'period' => c[:period], 'hotel' => c[:hotel], 'room' => c[:room], 'rate' => '10000' }
   end
 
@@ -33,7 +33,7 @@ class Api::V1::RateCacheServiceTest < ActiveSupport::TestCase
       Api::V1::RateCacheService.get_rate(period: 'Summer', hotel: 'FloatingPointResort', room: 'SingletonRoom')
     end
     assert_equal 36, captured.size
-    assert_equal Api::V1::RateCacheService::ALL_COMBINATIONS, captured
+    assert_equal PricingCatalog::ALL_COMBINATIONS, captured
   end
 
   test "API is called only once for multiple requests within the TTL" do
