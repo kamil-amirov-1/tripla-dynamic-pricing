@@ -1,5 +1,19 @@
 # Dynamic Pricing Take-home Assignment Solution
 
+## Reviewer notes
+
+The core design choice is batch refresh. Since there are only 36 valid combinations,
+one upstream batch call refreshes the whole catalog for a 5-minute window. This keeps
+normal upstream usage around 288 calls/day, below the 1,000/day limit.
+
+The Redis lock prevents cold-start stampedes, and missing rates are cached as a
+5-minute negative result so one absent combination does not repeatedly trigger refreshes.
+
+I intentionally did not add background warming or retries in this version. They are
+reasonable next steps, but the current request-driven refresh keeps the system smaller
+while meeting the stated requirements.
+
+---
 ## Overview
 
 A caching layer in front of Tripla's dynamic pricing model. The model is expensive
@@ -36,8 +50,8 @@ Redis is a shared store that all workers and containers read from and write to.
 ---
 ## Why a refresh lock
 
-Average load is fine, but a deploy restart can start all workers with an empty cache. Without a
-lock, 10 concurrent cold misses fire 10 upstream calls. A Redis `SET NX EX` lock
+Average load is fine, but a deploy restart can start all workers with an empty cache. 
+Without a lock, 10 concurrent cold misses fire 10 upstream calls. A Redis `SET NX EX` lock
 ensures only one process fetches at a time - everyone else waits, then reads from
 the populated cache. One call per window instead of N.
 
@@ -55,8 +69,8 @@ Each rate is stored under its own Redis key - `pricing:rate:{period}:{hotel}:{ro
 On a cache miss the service acquires the lock, fetches all 36 combinations in one
 batch call, writes each returned rate, and releases the lock. Only combinations in
 `PricingCatalog` are written - unknown rows are discarded. Concurrent misses wait for
-the lock holder then read from cache. If the lock holder writes neither a rate nor a missing marker,
-waiters raise a 503 rather than silently returning nil.
+the lock holder then read from cache. If the lock holder writes neither a rate 
+nor a missing marker, waiters raise a 503 rather than silently returning nil.
 
 Combinations the upstream did not return are cached as missing for the same 5-minute
 window and return 404. This avoids repeatedly calling upstream for a temporarily
@@ -108,7 +122,7 @@ beyond that would violate the core requirement.
 ---
 ## Observability
 
-I added structured logging because the main risk in this service is not CPU or database load, but upstream usage and cache behaviour.
+I added structured logging because the main risk in this service is not CPU or database load, but upstream usage and cache behavior.
 
 Request logs are compact single-line logs via Lograge. The pricing service also logs cache hits 
 and misses, refresh lock acquisition and waits, upstream refresh duration, and missing combination counts. 
@@ -159,3 +173,22 @@ Tests use an in-memory cache store - no Redis required to run the test suite.
 - `RATE_API_CONNECT_TIMEOUT` - TCP connection timeout in seconds. Default: `3`
 - `RATE_API_READ_TIMEOUT` - HTTP read timeout in seconds. Default: `10`
 - `REDIS_URL` - Redis connection URL. Required in production. Default: `redis://localhost:6379/0`
+
+---
+## AI usage
+
+I used AI assistance during this assignment as a coding and review aid.
+
+My process was:
+- I read the assignment requirements and upstream API documentation.
+- I made the core design decisions: batch-all refresh, Redis-backed shared cache,
+  refresh locking, negative caching for missing combinations, and fail-closed behavior
+  when Redis or the upstream API is unavailable.
+- I used AI to help draft code, tests, and README wording faster.
+- I reviewed the generated code line by line, adjusted the design when needed, and
+  only kept changes that matched my understanding of the requirements.
+- I ran the test suite in Docker and manually checked the implementation against the
+  assignment constraints before submission.
+
+In short, AI was used as a pair-programming assistant. The architecture, tradeoffs,
+final code review, and submission decisions are mine.
