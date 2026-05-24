@@ -88,9 +88,10 @@ The main components:
 I split errors by whose fault they are:
 - **400** - the client sent invalid or missing params. Caught before the service is
   called.
-- **503** - everything server-side: upstream timeout, upstream error, Redis
-  unavailable, a requested combination absent from the upstream response, or an
-  unexpected internal error.
+- **404** - valid params, but the rate for this combination was not returned by the
+  upstream API in the latest batch response.
+- **503** - server-side failure: upstream timeout, upstream error, Redis unavailable,
+  or an unexpected internal error.
 
 For now I specifically chose not to fall back to direct upstream calls when Redis is down.
 It feels like a helpful degradation, but it would bypass the rate-limit protection

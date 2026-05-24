@@ -14,8 +14,10 @@ class Api::V1::PricingController < ApplicationController
     service.run
     if service.valid?
       render json: { rate: service.result }
+    elsif service.not_found?
+      render json: { error: service.errors.join(', ') }, status: :not_found
     else
-      render json: { error: service.errors.join(', ') }, status: :bad_request
+      render json: { error: service.errors.join(', ') }, status: :service_unavailable
     end
   end
 
