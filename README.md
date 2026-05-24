@@ -13,7 +13,7 @@ My job was to make that sustainable.
 ---
 ## Why I chose batch-all caching
 
-My first instinct was to cache each `(period, hotel, room)` combination separately —
+My first instinct was to cache each `(period, hotel, room)` combination separately -
 fetch on miss, cache for 5 minutes, done. Then I did the math:
 
 - 4 seasons × 3 hotels × 3 rooms = **36 unique combinations**
@@ -44,26 +44,24 @@ read from and write to the same store, so one worker's fresh rates benefit all o
 ---
 ## How cache misses are handled
 
-Each rate is stored under its own Redis key — `pricing:rate:{period}:{hotel}:{room}`
+Each rate is stored under its own Redis key - `pricing:rate:{period}:{hotel}:{room}`
 - with a 5-minute TTL.
 
-When a request arrives for a combination that is not in Redis, the service fetches
-all 36 combinations in one upstream batch call, writes each returned rate as its own
-key, and logs any combinations absent from the response. Requests for returned
-combinations succeed. Requests for missing combinations get a 503 - the rate is unavailable right now (the next 
-refresh cycle might recover them). So a partial upstream failure does not affect users asking for rates that were returned.
+When a request arrives for a combination not in Redis, the service acquires a Redis
+lock (`SET NX EX`). The lock holder fetches all 36 combinations in one upstream batch
+call, writes each returned rate as its own key, and releases the lock. The lock TTL
+is set above the API read timeout so an orphaned lock self-expires before any waiter
+hits its deadline. Only known combinations from `PricingCatalog` are written - unknown
+rows from the upstream response are discarded.
 
-At the stated load (10,000 req/day ~ 0.12 req/sec), I chose not to add a refresh lock
-in this version. That keeps the implementation smaller for the assignment while still
-meeting the budget in normal operation - one batch refresh per 5-minute window is about
-288 upstream calls/day.
+Concurrent requests that hit the same cache miss wait for the lock holder to finish,
+then read from cache. If the lock holder fails, it releases without writing. Waiters
+detect the absent key and raise a 503 rather than silently treating the failure as
+"rate not found".
 
-The tradeoff is that concurrent cold-cache misses can trigger duplicate batch calls.
-Those duplicates do not affect correctness because all callers write fresh rates with
-the same TTL, but they can increase upstream usage during bursts or deploy restarts.
-
-todo: For a higher-concurrency deployment, the next hardening step is a Redis `SET NX` lock
-around batch refresh.
+Requests for combinations the upstream did not return get a 404 - the rate is
+unavailable right now and the next refresh cycle may recover it. A partial upstream
+response does not affect users asking for rates that were returned.
 
 ---
 ## Architecture
@@ -76,9 +74,10 @@ The main components:
 - **`PricingService`** - orchestrates the above, maps errors to user-facing messages,
   logs full exception class and message server-side for unexpected failures.
 - **`RateCacheService`** - owns the cache logic. Reads the requested per-combination
-  key from Redis. On miss, fetches all 36 combinations in one upstream batch call,
-  writes the returned rates as separate keys with a 5-minute TTL, and logs missing
-  combinations.
+  key from Redis. On miss, acquires a distributed lock, fetches all 36 combinations
+  in one upstream batch call, writes the returned rates as separate keys with a
+  5-minute TTL, and releases the lock. Concurrent misses wait for the lock holder;
+  if the holder fails, waiters raise a 503 rather than returning nil.
 - **`RateApiClient`** - HTTP wrapper around the upstream model. Handles batch
   requests, split timeouts, and normalises all network errors into `RateApiError`.
 
@@ -93,9 +92,9 @@ I split errors by whose fault they are:
 - **503** - server-side failure: upstream timeout, upstream error, Redis unavailable,
   or an unexpected internal error.
 
-For now I specifically chose not to fall back to direct upstream calls when Redis is down.
+I specifically chose not to fall back to direct upstream calls when Redis is down.
 It feels like a helpful degradation, but it would bypass the rate-limit protection
-and risk exhausting the daily quota. A 503 with a clear error message is more honest. (TBD)
+and risk exhausting the daily quota. A 503 with a clear error message is more honest.
 
 ---
 ## Alternatives considered
@@ -114,7 +113,7 @@ setup but is the standard for shared cache in containerised Rails services.
 **Single-key snapshot approach** - store all 36 rates in one Redis key and look up
 the requested combination in memory. Simpler to implement. Rejected because partial
 upstream responses make the snapshot semantically ambiguous: is the catalog fresh,
-degraded, or incomplete? Per-combination keys make that explicit — each key either
+degraded, or incomplete? Per-combination keys make that explicit - each key either
 exists (fresh rate) or is absent (genuinely unavailable), with no ambiguity about
 what the stored data represents.
 
@@ -126,11 +125,47 @@ while regenerating a value. I eliminated it, the assignment says a rate is valid
 ## Known limitations
 
 - **No proactive warming** - first request after each 5-minute window pays the
-  upstream latency. (TBD)
-- **No refresh lock** - concurrent cache misses can trigger multiple simultaneous
-  upstream calls. At the stated load this is acceptable, but at significantly higher
-  concurrency a Redis SET NX lock would eliminate redundant calls. (TBD)
+  upstream latency.
 - **No retry on upstream failure** - a single error returns 503 immediately.
-  Exponential backoff with a small retry count would be a sensible addition. (TBD)
-- **Single Redis instance** - no cluster HA. An outage returns 503 and
-  is logged; it does not degrade to unprotected upstream calls. (TBD)
+  Exponential backoff with a small retry count would be a sensible addition.
+- **Single Redis instance** - no cluster HA. An outage returns 503 and is logged;
+  it does not degrade to unprotected upstream calls.
+
+---
+## How to run
+
+```bash
+docker compose up --build
+```
+
+The Rails app starts on `http://localhost:3000`. 
+Example requests:
+
+**200:**
+```bash
+curl "http://localhost:3000/api/v1/pricing?period=Summer&hotel=FloatingPointResort&room=SingletonRoom"
+```
+```bash
+curl "http://localhost:3000/api/v1/pricing?period=Winter&hotel=FloatingPointResort&room=RestfulKing"
+```
+**400:**
+```bash
+curl "http://localhost:3000/api/v1/pricing?period=Summer&hotel=FloatingPointResort"
+```
+---
+## How to test
+
+```bash
+bin/rails test
+```
+
+Tests use an in-memory cache store - no Redis required to run the test suite.
+
+---
+## Environment variables
+
+- `RATE_API_URL` - URL of the upstream pricing API. Default: `http://localhost:8080`
+- `RATE_API_TOKEN` - Auth token for the upstream API. Default: `04aa6f42aa03f220c2ae9a276cd68c62`
+- `RATE_API_CONNECT_TIMEOUT` - TCP connection timeout in seconds. Default: `3`
+- `RATE_API_READ_TIMEOUT` - HTTP read timeout in seconds. Default: `10`
+- `REDIS_URL` - Redis connection URL. Required in production. Default: `redis://localhost:6379/0`
