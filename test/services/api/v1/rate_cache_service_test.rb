@@ -201,6 +201,28 @@ class Api::V1::RateCacheServiceTest < ActiveSupport::TestCase
     end
   end
 
+  test "raises RateApiError when cache read fails" do
+    Rails.cache.stub(:read, ->(_) { raise RuntimeError, 'Redis connection failed' }) do
+      error = assert_raises(RateApiError) do
+        Api::V1::RateCacheService.get_rate(period: 'Summer', hotel: 'FloatingPointResort', room: 'SingletonRoom')
+      end
+      assert_match 'Pricing cache unavailable', error.message
+    end
+  end
+
+  test "raises RateApiError when cache write fails" do
+    with_lock do
+      RateApiClient.stub(:get_rates_batch, mock_response(ALL_RATES)) do
+        Rails.cache.stub(:write, ->(*) { false }) do
+          error = assert_raises(RateApiError) do
+            Api::V1::RateCacheService.get_rate(period: 'Summer', hotel: 'FloatingPointResort', room: 'SingletonRoom')
+          end
+          assert_match 'Pricing cache unavailable', error.message
+        end
+      end
+    end
+  end
+
   test "does not cache rows for unknown combinations returned by the API" do
     rogue_rate = { 'period' => 'Summer', 'hotel' => 'UnknownHotel', 'room' => 'SingletonRoom', 'rate' => '99999' }
 
