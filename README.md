@@ -116,7 +116,7 @@ beyond that would violate the core requirement.
 ## How to run
 
 ```bash
-docker compose up --build
+docker compose up -d --build
 ```
 
 The Rails app starts on `http://localhost:3000`.
