@@ -15,7 +15,7 @@ module Api::V1
     LUA
 
     def self.get_rate(period:, hotel:, room:)
-      cached = Rails.cache.read(cache_key(period, hotel, room))
+      cached = read_cache(cache_key(period, hotel, room))
       if cached == MISSING
         Rails.logger.info("event=pricing_cache_hit result=missing period=#{period} hotel=#{hotel} room=#{room}")
         return nil
@@ -27,7 +27,7 @@ module Api::V1
 
       Rails.logger.info("event=pricing_cache_miss period=#{period} hotel=#{hotel} room=#{room}")
       ensure_cache_populated(period:, hotel:, room:)
-      cached = Rails.cache.read(cache_key(period, hotel, room))
+      cached = read_cache(cache_key(period, hotel, room))
       cached == MISSING ? nil : cached
     end
 
@@ -44,7 +44,7 @@ module Api::V1
         Rails.logger.info("event=pricing_lock_waiting")
         wait_for_lock_release
         # Lock holder failed without writing - raise instead of silent nil -> 404
-        raise RateApiError, 'Rate temporarily unavailable, please retry' if Rails.cache.read(cache_key(period, hotel, room)).nil?
+        raise RateApiError, 'Rate temporarily unavailable, please retry' if read_cache(cache_key(period, hotel, room)).nil?
       end
     end
 
@@ -63,19 +63,35 @@ module Api::V1
 
       rates.each do |r|
         next unless cacheable_rate?(r)
-        Rails.cache.write(cache_key(r['period'], r['hotel'], r['room']), r['rate'], expires_in: CACHE_TTL)
+        write_cache(cache_key(r['period'], r['hotel'], r['room']), r['rate'], expires_in: CACHE_TTL)
       end
 
       missing_count = 0
       PricingCatalog::ALL_COMBINATIONS.each do |c|
         next if rates.any? { |r| cacheable_rate?(r) && matches?(r, **c) }
-        Rails.cache.write(cache_key(c[:period], c[:hotel], c[:room]), MISSING, expires_in: CACHE_TTL)
+        write_cache(cache_key(c[:period], c[:hotel], c[:room]), MISSING, expires_in: CACHE_TTL)
         missing_count += 1
       end
 
       duration_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at) * 1000).round
       Rails.logger.info("event=pricing_upstream_success fetched=#{rates.size} missing=#{missing_count} duration_ms=#{duration_ms}")
       Rails.logger.warn("event=pricing_upstream_partial missing=#{missing_count}") if missing_count > 0
+    end
+
+    private_class_method def self.read_cache(key)
+      Rails.cache.read(key)
+    rescue => e
+      Rails.logger.error("event=pricing_cache_error operation=read message=#{e.class}:#{e.message}")
+      raise RateApiError, 'Pricing cache unavailable'
+    end
+
+    private_class_method def self.write_cache(key, value, expires_in:)
+      result = Rails.cache.write(key, value, expires_in: expires_in)
+      unless result
+        Rails.logger.error("event=pricing_cache_error operation=write key=#{key}")
+        raise RateApiError, 'Pricing cache unavailable'
+      end
+      result
     end
 
     private_class_method def self.acquire_lock(token)
