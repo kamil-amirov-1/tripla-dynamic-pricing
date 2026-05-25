@@ -97,6 +97,7 @@ that were returned.
 - **`RateCacheService`** - owns the cache logic. On miss, acquires a distributed lock, fetches all 36 combinations, writes each rate with a 5-minute TTL, and releases the lock.
 - **`RateApiClient`** - HTTP wrapper. Handles batch requests, split timeouts, and normalizes all errors into `RateApiError`.
 - **`PricingCatalog`** - single source of truth for valid periods, hotels, and rooms. Used by the controller for validation and by `RateCacheService` to build the batch request and filter unknown rows.
+- **`CacheWarmerWorker`** - Sidekiq job that runs every 4 minutes via sidekiq-cron, proactively refreshing all 36 combinations before the 5-minute TTL expires.
 
 ---
 ## Error handling
