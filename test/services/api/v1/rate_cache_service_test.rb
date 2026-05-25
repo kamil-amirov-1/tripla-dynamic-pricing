@@ -24,6 +24,23 @@ class Api::V1::RateCacheServiceTest < ActiveSupport::TestCase
     end
   end
 
+  test "warm_cache fetches all combinations and populates the cache" do
+    with_lock do
+      RateApiClient.stub(:get_rates_batch, mock_response(ALL_RATES)) do
+        Api::V1::RateCacheService.warm_cache
+        assert_equal '10000', Rails.cache.read('pricing:rate:Summer:FloatingPointResort:SingletonRoom')
+      end
+    end
+  end
+
+  test "warm_cache is a no-op when another process holds the lock" do
+    Api::V1::RateCacheService.stub(:acquire_lock, ->(_) { false }) do
+      RateApiClient.stub(:get_rates_batch, ->(_) { flunk 'API should not be called' }) do
+        Api::V1::RateCacheService.warm_cache
+      end
+    end
+  end
+
   test "returns cached rate without calling the API" do
     Rails.cache.write('pricing:rate:Summer:FloatingPointResort:SingletonRoom', '10000')
 

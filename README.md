@@ -3,15 +3,13 @@
 ## Reviewer notes
 
 The core design choice is batch refresh. Since there are only 36 valid combinations,
-one upstream batch call refreshes the whole catalog for a 5-minute window. This keeps
-normal upstream usage around 288 calls/day, below the 1,000/day limit.
+one upstream batch call refreshes the whole catalog for a 5-minute window.
 
 The Redis lock prevents cold-start stampedes, and missing rates are cached as a
 5-minute negative result so one absent combination does not repeatedly trigger refreshes.
 
-I intentionally did not add background warming or retries in this version. They are
-reasonable next steps, but the current request-driven refresh keeps the system smaller
-while meeting the stated requirements.
+A Sidekiq cron job warms the cache every 4 minutes so users do not wait for an upstream
+call after the first window. The existing Redis lock ensures only one refresh runs at a time.
 
 ---
 ## Overview
@@ -38,7 +36,8 @@ That is 10x over the 1,000/day limit, even with caching enabled.
 
 The model API supports **batch requests**, so I changed the strategy: on any cache
 miss, fetch **all 36 combinations** in one call and cache each rate for 5 minutes.
-That is **about 288 calls/day** with plenty of headroom.
+Request-driven refresh alone would cost about 288 calls/day. With proactive warming
+every 4 minutes the warmer uses about 360 calls/day - still well below the 1,000/day limit.
 
 ---
 ## Why Redis and not memory store
@@ -59,6 +58,17 @@ The release uses a Lua script instead of a plain `DELETE`. If the holder crashes
 the TTL expires, another process can acquire the lock before the cleanup runs - a
 plain `DELETE` would wipe it. The Lua script checks the token first, so only the
 original holder can release its own lock.
+
+---
+## Why proactive warming
+
+The request path refreshes the cache on demand, but the first request after a 5-minute
+window pays upstream latency. A Sidekiq cron job refreshes the catalog every 4 minutes,
+so rates are already warm before they expire in normal operation.
+
+This uses about 360 upstream calls/day, still below the 1,000/day limit. The same Redis
+lock is shared by both the warmer and user-triggered refreshes, so only one fetch can
+run at a time.
 
 ---
 ## How cache misses are handled
@@ -103,10 +113,8 @@ A 503 is more honest.
 ---
 ## Alternatives considered
 
-**Proactive cache warming** - a background job refreshes all 36 combinations every
-~4.5 minutes so the cache is always warm. Same API budget, better latency. I left it
-out because at ~0.12 req/s the miss latency is infrequent and acceptable, and a
-scheduler adds operational complexity I did not need yet.
+**Request-only refresh** - cache on demand, no background job. Simpler, but the first
+request after each 5-minute window pays upstream latency. Replaced by proactive warming.
 
 **file_store** - works across Puma workers on the same host but not across containers.
 Redis is the standard for shared cache in containerized Rails services.
@@ -131,8 +139,7 @@ In production, these are the signals to alert on before upstream quota or availa
 ---
 ## Known limitations
 
-- **No proactive warming** - first request after each 5-minute window pays the upstream latency.
-- **No retry on upstream failure** - a single error returns 503 immediately.
+- **No retry on upstream failure** - a single error returns 503 immediately. Retries are intentionally omitted - on a 1,000/day quota, retrying a failed call risks doubling upstream usage during an outage.
 - **Single Redis instance** - no cluster HA. An outage returns 503 and does not degrade to unprotected upstream calls.
 
 ---
@@ -142,7 +149,7 @@ In production, these are the signals to alert on before upstream quota or availa
 docker compose up -d --build
 ```
 
-The Rails app starts on `http://localhost:3000`.
+This starts the Rails app, rate-api, Redis, and Sidekiq. The Rails app is available on `http://localhost:3000`.
 Example requests:
 
 **200:**
@@ -173,6 +180,10 @@ Tests use an in-memory cache store - no Redis required to run the test suite.
 - `RATE_API_CONNECT_TIMEOUT` - TCP connection timeout in seconds. Default: `3`
 - `RATE_API_READ_TIMEOUT` - HTTP read timeout in seconds. Default: `10`
 - `REDIS_URL` - Redis connection URL. Required in production. Default: `redis://localhost:6379/0`
+- `REDIS_CONNECT_TIMEOUT` - Redis TCP connection timeout in seconds. Default: `1`
+- `REDIS_READ_TIMEOUT` - Redis read timeout in seconds. Default: `1`
+- `REDIS_WRITE_TIMEOUT` - Redis write timeout in seconds. Default: `1`
+- `REDIS_RECONNECT_ATTEMPTS` - Redis reconnect attempts on connection failure. Default: `3`
 
 ---
 ## AI usage
