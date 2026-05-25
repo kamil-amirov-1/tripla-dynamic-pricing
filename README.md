@@ -151,6 +151,11 @@ docker compose up -d --build
 ```
 
 This starts the Rails app, rate-api, Redis, and Sidekiq. The Rails app is available on `http://localhost:3000`.
+
+To stop all services:
+```bash
+docker compose down
+```
 Example requests:
 
 **200:**
