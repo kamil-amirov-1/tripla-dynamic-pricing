@@ -31,6 +31,17 @@ module Api::V1
       cached == MISSING ? nil : cached
     end
 
+    def self.warm_cache
+      token = SecureRandom.hex
+      return unless acquire_lock(token)
+      Rails.logger.info("event=cache_warmer_started")
+      begin
+        fetch_from_api_and_cache
+      ensure
+        release_lock(token)
+      end
+    end
+
     private_class_method def self.ensure_cache_populated(period:, hotel:, room:)
       token = SecureRandom.hex
       if acquire_lock(token)
@@ -112,7 +123,14 @@ module Api::V1
     end
 
     private_class_method def self.redis
-      @redis ||= Redis.new(url: ENV.fetch('REDIS_URL', 'redis://localhost:6379/0'))
+      @redis ||= Redis.new(
+        url:                ENV.fetch('REDIS_URL', 'redis://localhost:6379/0'),
+        connect_timeout:    ENV.fetch('REDIS_CONNECT_TIMEOUT', 1).to_f,
+        read_timeout:       ENV.fetch('REDIS_READ_TIMEOUT', 1).to_f,
+        write_timeout:      ENV.fetch('REDIS_WRITE_TIMEOUT', 1).to_f,
+        reconnect_attempts: ENV.fetch('REDIS_RECONNECT_ATTEMPTS', 3).to_i,
+        reconnect_delay:    0.5
+      )
     end
 
     private_class_method def self.cacheable_rate?(r)

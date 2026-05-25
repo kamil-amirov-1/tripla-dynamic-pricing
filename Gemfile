@@ -32,6 +32,10 @@ gem 'httparty'
 # Structured request logging
 gem 'lograge'
 
+# Background job processing and scheduling
+gem 'sidekiq'
+gem 'sidekiq-cron'
+
 # Use Rack CORS for handling Cross-Origin Resource Sharing (CORS), making cross-origin Ajax possible
 # gem "rack-cors"
 
