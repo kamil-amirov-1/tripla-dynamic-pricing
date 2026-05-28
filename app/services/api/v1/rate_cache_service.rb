@@ -54,7 +54,7 @@ module Api::V1
       else
         Rails.logger.info("event=pricing_lock_waiting")
         wait_for_lock_release
-        # Lock holder failed without writing - raise instead of silent nil -> 404
+        # Lock holder failed without writing - raise 503 instead of returning nil which would silently become 404
         raise RateApiError, 'Rate temporarily unavailable, please retry' if read_cache(cache_key(period, hotel, room)).nil?
       end
     end

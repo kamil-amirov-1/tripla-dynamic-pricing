@@ -17,7 +17,7 @@ module Api::V1
     rescue RateApiError => e
       errors << e.message
     rescue StandardError => e
-      Rails.logger.error("#{e.class}: #{e.message}")
+      Rails.logger.error("event=pricing_unexpected_error class=#{e.class} message=#{e.message}")
       errors << 'An unexpected error occurred'
     end
 
