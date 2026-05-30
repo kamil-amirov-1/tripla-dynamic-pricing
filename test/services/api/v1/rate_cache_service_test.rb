@@ -15,7 +15,7 @@ class Api::V1::RateCacheServiceTest < ActiveSupport::TestCase
 
   # Stubs lock acquire/release so tests don't need a live Redis connection.
   # Lock correctness is an infrastructure concern tested separately; these
-  # tests verify caching and API behaviour.
+  # tests verify caching and API behavior.
   def with_lock
     Api::V1::RateCacheService.stub(:acquire_lock, ->(_) { true }) do
       Api::V1::RateCacheService.stub(:release_lock, ->(_) { nil }) do
@@ -163,6 +163,18 @@ class Api::V1::RateCacheServiceTest < ActiveSupport::TestCase
 
     with_lock do
       RateApiClient.stub(:get_rates_batch, mock_response(rates_with_blank_rate)) do
+        assert_nil Api::V1::RateCacheService.get_rate(period: 'Summer', hotel: 'FloatingPointResort', room: 'SingletonRoom')
+      end
+    end
+  end
+
+  test "skips and returns nil for a row with a negative rate value" do
+    rates_with_negative_rate = ALL_RATES.map do |r|
+      r['period'] == 'Summer' && r['hotel'] == 'FloatingPointResort' && r['room'] == 'SingletonRoom' ? r.merge('rate' => '-1000') : r
+    end
+
+    with_lock do
+      RateApiClient.stub(:get_rates_batch, mock_response(rates_with_negative_rate)) do
         assert_nil Api::V1::RateCacheService.get_rate(period: 'Summer', hotel: 'FloatingPointResort', room: 'SingletonRoom')
       end
     end

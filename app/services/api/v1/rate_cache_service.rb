@@ -134,7 +134,8 @@ module Api::V1
     end
 
     private_class_method def self.cacheable_rate?(r)
-      r['period'].present? && r['hotel'].present? && r['room'].present? && r['rate'].present? &&
+      r['period'].present? && r['hotel'].present? && r['room'].present? &&
+        r['rate'].present? && r['rate'].to_f > 0 &&
         PricingCatalog::ALL_COMBINATIONS.any? { |c| matches?(r, **c) }
     end
 
